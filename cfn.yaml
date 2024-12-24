@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation Template for 1 VPC with 1 Public Subnet and 2 Private Subnets
+
+Parameters:
+    DomainName:
+        Type: String
+        Description: URL of the website
+        Default: example.com
+    CertificateArn: ## ARN of the SSL certificate in US East 1
+        Type: String
+        Description: ARN of the SSL certificate
+        Default: arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012
+    ApSE1CertificateArn: ## ARN of the SSL certificate in Asia Pacific (Seoul)
+        Type: String
+        Description: ARN of the SSL certificate in Singapore
+        Default: arn:aws:acm:ap-southeast-2:123456789012:certificate/12345678-1234-1234-1234-123456789012
+Mappings:
+    Route53Map:
+        HostedZone:
+            Id: Z10018743MTQ6NWBKG6VN
+Resources:
+    S3Bucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: !Sub www.${DomainName}
+            VersioningConfiguration:
+                Status: Enabled
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: false
+                BlockPublicPolicy: false
+                IgnorePublicAcls: false
+                RestrictPublicBuckets: false
+            OwnershipControls:
+                Rules:
+                    - ObjectOwnership: BucketOwnerPreferred
+            WebsiteConfiguration:
+                RedirectAllRequestsTo:
+                    HostName: !Sub www.${DomainName}
+                    Protocol: https
+
+    S3BucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        Properties:
+            Bucket: !Ref S3Bucket
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Action: s3:GetObject
+                      Effect: Allow
+                      Resource: !Sub ${S3Bucket.Arn}/*
+                      Principal:
+                          Service: cloudfront.amazonaws.com
+                      Condition:
+                          StringEquals:
+                              AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+    CloudFrontDistribution:
+        Type: AWS::CloudFront::Distribution
+        Properties:
+            DistributionConfig:
+                Aliases:
+                    - !Sub www.${DomainName}
+                Origins:
+                    - Id: S3Origin
+                      DomainName: !GetAtt S3Bucket.RegionalDomainName
+                      S3OriginConfig:
+                          OriginAccessIdentity: ""
+                      OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+                Enabled: true
+                DefaultRootObject: index.html
+                HttpVersion: http2
+                DefaultCacheBehavior:
+                    AllowedMethods:
+                        - GET
+                        - HEAD
+                    TargetOriginId: S3Origin
+                    ViewerProtocolPolicy: redirect-to-https
+                    MinTTL: 0
+                    DefaultTTL: 86400
+                    MaxTTL: 31536000
+                    Compress: true
+                    CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+                ViewerCertificate:
+                    AcmCertificateArn: !Ref CertificateArn
+                    SslSupportMethod: sni-only
+
+    CloudFrontOriginAccessControl:
+        Type: AWS::CloudFront::OriginAccessControl
+        Properties:
+            OriginAccessControlConfig:
+                Description: Default Origin Access Control
+                Name: CloudFrontOriginAccessControl
+                OriginAccessControlOriginType: s3
+                SigningBehavior: always
+                SigningProtocol: sigv4
+    Route53ARecord:
+        Type: AWS::Route53::RecordSet
+        Properties:
+            Name: !Join ["", [www, ., !Ref DomainName]]
+            HostedZoneId: !FindInMap [Route53Map, HostedZone, Id]
+            Type: A
+            AliasTarget:
+                DNSName: !GetAtt CloudFrontDistribution.DomainName
+                HostedZoneId: "Z2FDTNDATAQYW2" # Fixed value for CloudFront
+    Route53ApexARecord:
+        Type: AWS::Route53::RecordSet
+        Properties:
+            Name: !Ref DomainName
+            HostedZoneId: !FindInMap [Route53Map, HostedZone, Id]
+            Type: A
+            AliasTarget:
+                DNSName: !Ref Route53ARecord
+                HostedZoneId: !FindInMap [Route53Map, HostedZone, Id]
+    DynamoDBTable:
+        Type: AWS::DynamoDB::Table
+        Properties:
+            TableName: !Sub ${DomainName}-table
+            AttributeDefinitions:
+                - AttributeName: id
+                  AttributeType: S
+            KeySchema:
+                - AttributeName: id
+                  KeyType: HASH
+            OnDemandThroughput:
+                MaxReadRequestUnits: 5
+                MaxWriteRequestUnits: 5
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+            BillingMode: PAY_PER_REQUEST
+    LambdaExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: LambdaExecutionPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:PutItem
+                                - dynamodb:GetItem
+                                - dynamodb:Scan
+                                - dynamodb:Query
+                                - dynamodb:UpdateItem
+                            Resource: !GetAtt DynamoDBTable.Arn
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    LambdaFunction:
+        Type: AWS::Lambda::Function
+        Properties:
+            Handler: lambda/index.handler
+            Code:
+                S3Bucket: churchmilky
+                S3Key: lambda.zip
+            Role: !GetAtt LambdaExecutionRole.Arn
+            Runtime: nodejs22.x
+            Timeout: 10
+            Environment:
+                Variables:
+                    TABLE_NAME: !Ref DynamoDBTable
+    ApiGatewayIamRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: apigateway.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: ApiGatewayPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - lambda:* # Allow all actions on the Lambda function
+                            Resource: !GetAtt LambdaFunction.Arn
+    MyHttpApi:
+        Type: AWS::ApiGatewayV2::Api
+        Properties:
+            Name: MyHttpApi
+            ProtocolType: HTTP
+            CorsConfiguration:
+                AllowOrigins:
+                    - "*"
+                AllowMethods:
+                    - GET
+                    - POST
+                    - PUT
+                    - DELETE
+                AllowHeaders:
+                    - "*" # Allow all headers
+    MyHttpApiIntegration:
+        Type: AWS::ApiGatewayV2::Integration
+        Properties:
+            ApiId: !Ref MyHttpApi
+            IntegrationType: AWS_PROXY
+            CredentialsArn: !GetAtt ApiGatewayIamRole.Arn
+            IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction.Arn}/invocations
+            PayloadFormatVersion: 2.0
+    MyHttpApiRoute:
+        Type: AWS::ApiGatewayV2::Route
+        Properties:
+            ApiId: !Ref MyHttpApi
+            RouteKey: ANY /{proxy+}
+            Target: !Sub integrations/${MyHttpApiIntegration}
+    MyApiStage:
+        Type: AWS::ApiGatewayV2::Stage
+        Properties:
+            ApiId: !Ref MyHttpApi
+            StageName: prod
+            AutoDeploy: true
+    MyApiDeployment:
+        Type: AWS::ApiGatewayV2::Deployment
+        Properties:
+            ApiId: !Ref MyHttpApi
+    MyApiDeploymentDomainName:
+        Type: AWS::ApiGatewayV2::DomainName
+        Properties:
+            DomainName: !Sub api.${DomainName}
+            DomainNameConfigurations:
+                - CertificateArn: !Ref ApSE1CertificateArn
+                  CertificateName: !Sub api.${DomainName}
+    MyApiDeploymentMapping:
+        Type: AWS::ApiGatewayV2::ApiMapping
+        Properties:
+            ApiId: !Ref MyHttpApi
+            DomainName: !Ref MyApiDeploymentDomainName
+            Stage: !Ref MyApiStage
+    LambdaInvokePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            Action: lambda:InvokeFunction
+            FunctionName: !Ref LambdaFunction # Reference to the Lambda function
+            Principal: apigateway.amazonaws.com
+            SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyHttpApi}/*/*
+    ApiRoute53ARecord:
+        Type: AWS::Route53::RecordSet
+        Properties:
+            Name: !Sub api.${DomainName}
+            HostedZoneId: !FindInMap [Route53Map, HostedZone, Id]
+            Type: A
+            AliasTarget:
+                DNSName: !GetAtt MyApiDeploymentDomainName.RegionalDomainName
+                HostedZoneId: !GetAtt MyApiDeploymentDomainName.RegionalHostedZoneId
+Outputs:
+    S3BucketId:
+        Description: S3 Bucket ID
+        Value: !Ref S3Bucket
+
+    CloudFrontDistributionId:
+        Description: CloudFront Distribution ID
+        Value: !Ref CloudFrontDistribution
+
+    Route53ARecordName:
+        Description: Route 53 A Record Name
+        Value: !Ref Route53ARecord
+
+    DynamoDBTableName:
+        Description: DynamoDB Table Name
+        Value: !Ref DynamoDBTable
+
+    LambdaFunctionName:
+        Description: Lambda Function Name
+        Value: !Ref LambdaFunction
+
+    MyHttpApiId:
+        Description: HTTP API ID
+        Value: !Ref MyHttpApi
+
+    MyApiDeploymentDomainNameHostedZoneId:
+        Description: Hosted Zone ID
+        Value: !GetAtt [MyApiDeploymentDomainName, RegionalHostedZoneId]
