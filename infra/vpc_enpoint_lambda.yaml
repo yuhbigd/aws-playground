@@ -1,0 +1,45 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  VpcIdParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: 'The parameter store key for the VPC ID'
+    Default: 'vpc-id'
+  SubnetIdsParameter:
+    Type: 'AWS::SSM::Parameter::Value<List<String>>'
+    Description: 'The parameter store key for the Subnet IDs'
+    Default: 'vpc-share-subnet'
+  RouteTableIdParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: 'The parameter store key for the Route Table ID'
+    Default: 'rtb-share-table'
+Resources:
+  # S3 Gateway Endpoint
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !Ref VpcIdParameter
+      RouteTableIds: !Ref RouteTableIdParameter
+      VpcEndpointType: Gateway
+
+  # SQS Interface Endpoint Security Group
+  SQSEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for SQS Interface Endpoint"
+      VpcId: !Ref VpcIdParameter
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0  # Replace with your specific CIDR range if needed
+
+  # SQS Interface Endpoint
+  SQSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sqs"
+      VpcId: !Ref VpcIdParameter
+      SubnetIds: !Ref SubnetIdsParameter
+      SecurityGroupIds:
+        - !Ref SQSEndpointSecurityGroup
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true  # Enable private DNS

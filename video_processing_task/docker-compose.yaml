@@ -1,0 +1,17 @@
+version: '3.7'
+
+services:
+  worker:
+    image: celery_worker:release
+    env_file:
+      - .env
+    volumes:
+      - ./video:/app/video
+  worker2:
+    image: celery_worker:release
+    env_file:
+      - .env
+    volumes:
+      - ./video:/app/video
+volumes:
+  video:

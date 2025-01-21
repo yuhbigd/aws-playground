@@ -1,0 +1,69 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  S3BucketName:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: The name of the S3 bucket
+    Default: s3-bucket-name
+  S3BucketArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: The ARN of the S3 bucket
+    Default: s3-bucket-arn
+Resources:
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: "Restrict access to my S3 bucket"
+        Name: "MyOAC"
+        OriginAccessControlOriginType: "s3"
+        SigningBehavior: "always"
+        SigningProtocol: "sigv4"
+
+  CloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: "My CloudFront distribution"
+        Origins:
+          - DomainName: !Sub "${S3BucketName}.s3.amazonaws.com"
+            OriginPath: "/video/output"
+            Id: "MyS3Origin"
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: "658327ea-f89d-4fab-a63d-7e88639e58f6" # CachingOptimized managed cache policy
+          Compress: true
+          OriginRequestPolicyId: "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf" # CORS-S3 managed origin request policy
+          ResponseHeadersPolicyId: "60669652-455b-4ae9-85a4-c4c02393f86c"
+          TargetOriginId: "MyS3Origin"
+          ViewerProtocolPolicy: "allow-all"
+        PriceClass: "PriceClass_All"
+        HttpVersion: "http2and3"
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3BucketName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: s3:GetObject
+            Effect: Allow
+            Resource: !Sub "${S3BucketArn}/*"
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFront}"
+Outputs:
+  CloudFront:
+    Description: "CloudFront Distribution ID"
+    Value: !Ref CloudFront

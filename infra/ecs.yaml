@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  SubnetIdsParameter:
+    Type: 'AWS::SSM::Parameter::Value<List<String>>'
+    Description: 'The parameter store key for the Subnet IDs'
+    Default: 'vpc-share-subnet'
+  RouteTableIdParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: 'The parameter store key for the Route Table ID'
+    Default: 'rtb-share-table'
+  SSHKeyPairParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: 'The parameter store key for the SSH Key Pair'
+    Default: 'ssh-key-pair'
+  SecurityGroupIdParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: 'The parameter store key for the Route Table ID'
+    Default: 'sg-share'
+  AWSSecretKetParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: 'The parameter store key for the AWS Secret Key'
+    Default: 'aws-secret' # <AWS:ACCESS_KEY>:<AWS:SECRET_KEY>
+  S3BucketNameParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: The name of the S3 bucket
+    Default: s3-bucket-name
+  S3BucketArnParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: The ARN of the S3 bucket
+    Default: s3-bucket-arn
+  AWSECSTaskRoleParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: The ARN of the ECS Task Role
+    Default: ecs-task-role
+  AWSECSTaskExecutionRoleParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: The ARN of the ECS Task Execution Role
+    Default: ecs-task-execution-role
+  AWSECSServiceScalingRoleArnParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: The ARN of the ECS Service Scaling Role
+    Default: ecs-service-scaling-role
+Resources:
+  ECSCluster:
+      Type: AWS::ECS::Cluster
+      Properties:
+        ClusterName: cluster
+        ClusterSettings:
+          - Name: containerInsights
+            Value: enabled
+  ASGLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: "asg-launch-template"
+      LaunchTemplateData:
+        ImageId: ami-0e90d07b6fcbf49f7 # Amazon Linux 2023 AMI ecs optimized
+        KeyName: !Ref SSHKeyPairParameter
+        SecurityGroupIds: !Ref SecurityGroupIdParameter
+        InstanceType: c6g.large
+        IamInstanceProfile:
+          Name: ec2_admin_role
+        UserData:
+          Fn::Base64: !Sub |
+           #!/bin/bash
+            echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            yum install -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource ContainerInstances --configsets full_install --region ${AWS::Region} &
+            cd /
+            yum install -y gcc libstdc++-devel gcc-c++ fuse fuse-devel curl-devel libxml2-devel mailcap automake openssl-devel git
+            git clone https://github.com/s3fs-fuse/s3fs-fuse
+            cd s3fs-fuse/
+            ./autogen.sh
+            ./configure --prefix=/usr --with-openssl
+            make
+            make install
+            cd /usr
+            sudo echo ${AWSSecretKetParameter} | sudo tee /usr/.passwd-s3fs > /dev/null
+            sudo chmod 600 /usr/.passwd-s3fs
+            sudo mkdir /usr/ecs
+            sudo chmod 777 /usr/ecs
+            sudo mkdir /usr/ecs/data
+            sudo chmod 777 /usr/ecs/data
+            sudo s3fs ${S3BucketNameParameter}:/video /usr/ecs/data -o passwd_file=/usr/.passwd-s3fs -o allow_other
+         # Disable IMDSv1, and require IMDSv2
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+  ASG:
+    DependsOn: ECSCluster
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: ASG
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref ASGLaunchTemplate
+            Version: !GetAtt ASGLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: c6g.large
+            - InstanceType: c5.large
+            - InstanceType: c5a.large
+        InstancesDistribution:
+          OnDemandPercentageAboveBaseCapacity: 0
+          SpotAllocationStrategy: "lowest-price"
+      MinSize: 0
+      MaxSize: 5
+      DesiredCapacity: 0
+      VPCZoneIdentifier: !Ref SubnetIdsParameter
+      AvailabilityZoneDistribution: 
+        CapacityDistributionStrategy: "balanced-best-effort"
+  # Create an ECS capacity provider to attach the ASG to the ECS cluster
+  # so that it autoscales as we launch more containers
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref ASG
+        ManagedScaling:
+          InstanceWarmupPeriod: 60
+          MinimumScalingStepSize: 1
+          MaximumScalingStepSize: 5
+          Status: ENABLED
+          # Percentage of cluster reservation to try to maintain
+          TargetCapacity: 100
+  # Create a cluster capacity provider assocation so that the cluster
+  # will use the capacity provider
+  CapacityProviderAssociation:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      CapacityProviders:
+        - !Ref CapacityProvider
+      Cluster: !Ref ECSCluster
+      DefaultCapacityProviderStrategy:
+        - Base: 0
+          CapacityProvider: !Ref CapacityProvider
+          Weight: 1
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ExecutionRoleArn: !Ref AWSECSTaskExecutionRoleParameter
+      TaskRoleArn: !Ref AWSECSTaskRoleParameter
+      RequiresCompatibilities:
+        - EC2
+      ContainerDefinitions:
+        - Name: celery_worker
+          Image: 520859269825.dkr.ecr.ap-southeast-1.amazonaws.com/celery_worker:release
+          MountPoints:
+            - SourceVolume: my-vol
+              ContainerPath: "/app/video"
+          Cpu: 1792
+          Memory: 3500
+          Essential: true
+          EnvironmentFiles:
+            - Value: !Sub "${S3BucketArnParameter}/.env"
+              Type: "s3"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-create-group: true
+              awslogs-group: /ecs/video-processing
+              awslogs-region: ap-southeast-1
+              awslogs-stream-prefix: ecs
+      Volumes:
+        - Host:
+            SourcePath: "/usr/ecs/data"
+          Name: my-vol
+  ECSService:
+    Type: 'AWS::ECS::Service'
+    Properties:
+      ServiceName: cfn-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      CapacityProviderStrategy:
+        - CapacityProvider: !Ref CapacityProvider
+          Weight: 1
+          Base: 0
+  ECSServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: 1
+      MaxCapacity: 5
+      ResourceId: !Sub
+        - "service/${ECSCluster}/${ECSServiceName}"
+        - ECSServiceName: !GetAtt ECSService.Name
+      RoleARN: !Ref AWSECSServiceScalingRoleArnParameter
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  ECSServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ECSServiceCPUScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ECSServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+Outputs:
+  ASGLaunchTemplate:
+    Description: "Launch Template ID"
+    Value: !Ref ASGLaunchTemplate
+  ASG:
+    Description: "Auto Scaling Group Name"
+    Value: !Ref ASG
+  CapacityProvider:
+    Description: "ECS Capacity Provider"
+    Value: !Ref CapacityProvider
+  Cluster:
+    Description: "ECS Cluster Name"
+    Value: !Ref ECSCluster
+  ECSTaskDefinition:
+    Description: The created Taskdefinition.
+    Value: !Ref ECSTaskDefinition 

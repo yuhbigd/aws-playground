@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  SubnetIdsParameter:
+    Type: 'AWS::SSM::Parameter::Value<List<String>>'
+    Description: 'The parameter store key for the Subnet IDs'
+    Default: 'vpc-share-subnet'
+  SecurityGroupIdParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: 'The parameter store key for the Route Table ID'
+    Default: 'sg-share'
+  RedisPasswordParameter:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: 'The parameter store key for the Route Table ID'
+    Default: 'redis-password'
+Resources:
+  SubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Cache Subnet Group
+      SubnetIds: !Ref SubnetIdsParameter
+  ElastiCacheUserGroup:
+    Type: AWS::ElastiCache::UserGroup
+    Properties:
+      Engine: redis
+      UserGroupId: user-group-1
+      UserIds: 
+        - !Ref ElasticCacheUser
+        - !Ref DefaultElasticCacheUser
+  ElasticCacheUser:
+    Type: AWS::ElastiCache::User
+    Properties:
+      AccessString: "on ~* +@all"
+      AuthenticationMode: 
+        Type: password 
+        Passwords: !Ref RedisPasswordParameter
+      Engine: redis
+      UserId: user
+      UserName: user
+  DefaultElasticCacheUser:
+    Type: AWS::ElastiCache::User
+    Properties:
+      AccessString: "off ~* +@all"
+      AuthenticationMode: 
+        Type: no-password-required
+      Engine: redis
+      UserId: default-redis
+      UserName: default
+  MyReplicationGroup:
+    Type: 'AWS::ElastiCache::ReplicationGroup'
+    Properties:
+      ReplicationGroupDescription: my description
+      NumCacheClusters: '1'
+      Engine: redis
+      CacheNodeType: cache.t2.micro    
+      AutomaticFailoverEnabled: 'false'
+      CacheSubnetGroupName: !Ref SubnetGroup
+      EngineVersion: 6.2
+      TransitEncryptionEnabled: 'true'
+      SecurityGroupIds: !Ref SecurityGroupIdParameter
+      UserGroupIds:
+        - !Ref ElastiCacheUserGroup
+  # EC2NatInstance:
+  #   DependsOn: MyReplicationGroup
+  #   Type: 'AWS::EC2::Instance'
+  #   Properties:
+  #     ImageId: ami-0f71084a395cb0d19
+  #     InstanceType: t2.micro
+  #     KeyName: huypeyi@gmail.com_aws_key
+  #     NetworkInterfaces:
+  #       - AssociatePublicIpAddress: 'true'
+  #         DeviceIndex: '0'
+  #         GroupSet: !Ref SecurityGroupIdParameter
+  #         SubnetId: subnet-06e39c725cfbbfca6
+Outputs:
+  ReplicationGroup:
+    Description: Replication Group
+    Value: !Ref MyReplicationGroup
+  UserGroup:
+    Description: User Group
+    Value: !Ref ElastiCacheUserGroup
